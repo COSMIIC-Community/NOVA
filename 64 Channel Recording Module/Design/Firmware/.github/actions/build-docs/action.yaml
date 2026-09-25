@@ -1,0 +1,93 @@
+name: 'build-docs'
+description: 'Builds documentation using Doxygen'
+inputs:
+  docs_dir:
+    description: 'Path to documentation dir, relative to build_dir'
+    required: true
+  github_token:
+    description: 'GitHub token'
+    required: true
+  build_dir:
+    description: 'Build directory'
+    required: false
+    default: ''
+  destination_dir:
+    description: 'Directory name for deployed docs'
+    required: false
+    default: ''
+  docs_branch:
+    description: 'Documentation branch'
+    required: false
+    default: 'gh-pages'
+  doxygen_version:
+    description: 'Version of Doxygen to install'
+    required: false
+    default: "1.12.0"
+  config_file:
+    description: 'Path of the Doxygen configuration file'
+    required: true
+    default: "Doxyfile"
+  docs_version: 
+    description: 'Version to show in Doxygen'
+    required: false
+    default: 'git-main'
+
+outputs:
+  version:
+    description: 'Version of the generated docs'
+    value: ${{ steps.get-docs-version.outputs.version }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: "true"
+
+    - name: Install dependencies
+      run: sudo apt-get update && sudo apt-get install -y wget graphviz
+      shell: bash
+
+    - name: Install Doxygen v${{ inputs.doxygen_version }}
+      run: |
+        transformed_version=$(echo "${{ inputs.doxygen_version }}" | tr '.' '_')
+        wget https://github.com/doxygen/doxygen/releases/download/Release_${transformed_version}/doxygen-${{ inputs.doxygen_version }}.linux.bin.tar.gz
+        tar -xzf doxygen-${{ inputs.doxygen_version }}.linux.bin.tar.gz
+        sudo mv doxygen-${{ inputs.doxygen_version }}/bin/doxygen /usr/local/bin/doxygen
+      shell: bash
+
+    - name: Generate Doxygen Documentation
+      run: doxygen ${{ inputs.config_file }}
+      env: 
+        PROJECT_VERSION: ${{ inputs.docs_version }}
+      shell: bash
+      
+    - name: Create .nojekyll (ensures pages with underscores work on gh pages)
+      run: touch ./.nojekyll
+      shell: bash
+
+    - name: Get docs version
+      id: get-docs-version
+      shell: bash
+      run: |
+        subdir=$(basename $(find ${{ inputs.build_dir }}/${{ inputs.docs_dir }} -mindepth 1 -maxdepth 1 -type d | head -n 1))
+        echo "version=$subdir" >> $GITHUB_OUTPUT
+
+    - name: Deploy docs
+      if: ${{ inputs.destination_dir != '' }}
+      uses: peaceiris/actions-gh-pages@v4
+      with:
+        github_token: ${{ inputs.github_token }}
+        publish_dir: ${{ inputs.build_dir }}/${{ inputs.docs_dir }}/${{ steps.get-docs-version.outputs.version }}
+        destination_dir: ${{ inputs.destination_dir }}
+        publish_branch: ${{ inputs.docs_branch }}
+
+    - name: Deploy docs
+      if: ${{ inputs.destination_dir == '' }}
+      uses: peaceiris/actions-gh-pages@v4
+      with:
+        github_token: ${{ inputs.github_token }}
+        publish_dir: ${{ inputs.build_dir }}/${{ inputs.docs_dir }}/${{ steps.get-docs-version.outputs.version }}
+        destination_dir: ${{ steps.get-docs-version.outputs.version }}
+        publish_branch: ${{ inputs.docs_branch }}

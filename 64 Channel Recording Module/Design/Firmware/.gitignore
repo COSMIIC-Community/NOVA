@@ -22,7 +22,7 @@
 *.la
 *.lo
 
-# Shared objects (inc. Windows DLLs)
+# Shared objects (incl. Windows DLLs)
 *.dll
 *.so
 *.so.*
@@ -50,3 +50,9 @@ modules.order
 Module.symvers
 Mkfile.old
 dkms.conf
+
+# IDE / build dirs
+.idea/
+build/
+Debug/
+cmake-build-*/

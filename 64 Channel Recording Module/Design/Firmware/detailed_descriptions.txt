@@ -1,0 +1,1437 @@
+boot.c
+--------------------------------------------------------------------------------
+Implements bootloader communication protocol for the module. Provides query
+and response mechanism for identifying module during boot sequence.
+
+processBOOT()
+    Processes bootloader query messages arriving on COB-ID 0x140. When module
+    receives a query with its node ID and zeros in data bytes 1 and 2, it
+    responds with a 7-byte message on COB-ID 0x150 containing module type
+    (product code from object 0x1018), application status byte (0x02 indicates
+    app is running), serial number (16-bit from object 0x1018), firmware
+    revision number (16-bit from object 0x1018), and node ID. Returns result
+    of canSend() operation or 0 if message format does not match expected
+    bootloader query format.
+
+
+emcy.c
+--------------------------------------------------------------------------------
+Implements CANopen Emergency (EMCY) protocol for error reporting and recovery.
+Manages error state machine and transmits emergency messages when errors occur.
+
+emergencyInit()
+    Initializes emergency subsystem by registering callback for object
+    dictionary index 0x1003 subindex 0 to monitor error number changes. Sets
+    error_number pointer to 0 indicating no active errors at startup.
+
+emergencyStop()
+    Stops emergency subsystem. Currently empty placeholder for future cleanup
+    operations when emergency services are disabled.
+
+OnNumberOfErrorsUpdate()
+    Callback triggered when index 0x1003 (Pre-defined Error Field) is updated.
+    If error_number is written to 0, clears entire error history by zeroing all
+    error_first_element entries up to error_history_size. Otherwise does
+    nothing to preserve error history. Returns 0 on success.
+
+sendEMCY()
+    Constructs and transmits 8-byte emergency message with COB-ID from
+    error_cobid. Message contains error code (16-bit little endian in bytes
+    0-1), error register value in byte 2, and manufacturer error field (bytes
+    3-7, currently unused). Returns result of canSend() operation.
+
+EMCY_setError()
+    Reports new error condition. First searches error_data array to check if
+    error code already exists. If found and inactive, marks as active. If not
+    found, searches for first free slot in error_data array (max EMCY_MAX_ERRORS
+    entries). Stores error code, error register mask, and sets active flag.
+    Updates error state machine to Error_occurred. Computes error register by
+    ORing all active error masks and stores in object 0x1001. Updates
+    Pre-defined Error Field (0x1003) by shifting history and inserting new
+    error with additional info in upper 16 bits. Increments error_number if
+    below history size limit. If emergency communication is enabled, calls
+    sendEMCY() to transmit message. Returns 0 on success, 1 if error_data is
+    full.
+
+EMCY_errorRecovered()
+    Marks error as recovered. Searches error_data for matching error code. If
+    found and active, clears active flag. Recomputes error register by checking
+    all remaining active errors. If no errors remain active, sets error state
+    to Error_free and transmits error reset message (code 0x0000, register 0x00)
+    if communication is enabled. Updates error_register with new computed value.
+
+proceedEMCY()
+    Processes received emergency message. Validates message length is 8 bytes.
+    Extracts node ID from COB-ID (lower 7 bits), error code from bytes 0-1
+    (little endian), and error register from byte 2. Calls user post_emcy
+    callback with extracted values.
+
+_post_emcy()
+    Weak placeholder function for user-defined emergency message handler.
+    Application can override to implement custom emergency processing.
+
+
+lifegrd.c
+--------------------------------------------------------------------------------
+Implements CANopen heartbeat and node guarding protocols for monitoring network
+node health and detecting communication failures.
+
+getNodeState()
+    Retrieves current state of remote node from NMTable using nodeId as index.
+    Returns e_nodeState enumeration value representing node's operational state.
+
+ConsumerHearbeatAlarm()
+    Timer callback triggered when expected heartbeat from remote node does not
+    arrive within configured timeout period. Clears timer handle in
+    ConsumerHeartBeatTimers array to mark as expired (non-periodic timer).
+    Extracts nodeId from ConsumerHeartbeatEntries (bits 16-23) and invokes
+    user heartbeatError callback to notify application of lost heartbeat.
+
+processNODE_GUARD()
+    Processes node guarding and heartbeat messages. If message RTR bit is set,
+    treats as node guarding request from master. Checks if request targets this
+    node's ID. If match, constructs response with COB-ID 0x700 + nodeId,
+    includes current nodeState, toggles bit 7 based on toggle flag for error
+    detection, and transmits response. If RTR is not set, treats as incoming
+    slave heartbeat. Stores received state in NMTable (lower 7 bits of data
+    byte 0). For each consumer heartbeat entry matching received nodeId,
+    cancels existing timer and schedules new alarm using configured heartbeat
+    time from ConsumerHeartbeatEntries (lower 16 bits). This renews timeout
+    period each time heartbeat arrives.
+
+ProducerHearbeatAlarm()
+    Timer callback for generating heartbeat transmissions. If
+    ProducerHeartBeatTime is non-zero, constructs message with COB-ID 0x700 +
+    nodeId, sets length to 1, includes nodeState in data byte 0 (no toggle bit
+    for heartbeat), and transmits via canSend(). If ProducerHeartBeatTime is
+    zero, cancels timer to stop heartbeat generation.
+
+OnHeartbeatProducerUpdate()
+    Callback triggered when object 0x1017 (Producer Heartbeat Time) is modified.
+    Stops existing heartbeat generation by calling heartbeatStop(), then
+    reinitializes with new settings via heartbeatInit(). Returns 0.
+
+heartbeatInit()
+    Initializes heartbeat consumer and producer services. Registers callback for
+    object 0x1017 changes. Clears toggle flag. Iterates through
+    ConsumerHeartbeatCount entries, extracting timeout values (lower 16 bits)
+    and scheduling ConsumerHearbeatAlarm for each non-zero entry. If
+    ProducerHeartBeatTime is configured, immediately calls ProducerHearbeatAlarm
+    to send first heartbeat, then schedules periodic timer for continued
+    heartbeat generation.
+
+heartbeatStop()
+    Terminates heartbeat services. Cancels all consumer heartbeat timers by
+    iterating through ConsumerHeartBeatTimers array and calling DelAlarm() for
+    each. Cancels producer heartbeat timer stored in ProducerHeartBeatTimer.
+
+_heartbeatError()
+    Weak placeholder for application-defined heartbeat error handler. Called
+    when consumer heartbeat timeout occurs.
+
+_post_SlaveBootup()
+    Weak placeholder for application-defined boot-up notification handler. Would
+    be called when slave node sends boot-up message (currently unused in this
+    implementation).
+
+
+lss.c
+--------------------------------------------------------------------------------
+Implements CANopen Layer Setting Services (LSS) protocol for remote
+configuration of node ID and baud rate without requiring physical access to
+device.
+
+LssAlarmMSG()
+    Timeout handler for LSS message responses. Stops message timer. For
+    FastScan command, if at least one node answered (LSSanswer != 0) before
+    timeout, transitions to LSS_FS_PROCESSING state and initiates FastScan
+    protocol by computing bit mask and sending first FastScan message. If no
+    answers received, sets state to LSS_FINISHED indicating no unconfigured
+    nodes exist. For other commands like LSS_IDENT_REMOTE_NON_CONF, timeout
+    means no unconfigured slaves detected. Otherwise, timeout indicates error
+    and sets state to LSS_ABORTED_INTERNAL. Invokes user callback if configured
+    to notify of timeout or completion.
+
+LssAlarmSDELAY()
+    Handles baud rate switch delay timing. LSS requires two-phase delay when
+    changing baud rate. In SDELAY_FIRST phase, stores current node state and
+    calls canChangeBaudRate() to switch physical baud rate, transitions to
+    SDELAY_SECOND. In SDELAY_SECOND phase, restores normal communication by
+    updating canHandle pointer (slave) or calling user callback (master),
+    clears switchDelayState, and stops timer.
+
+LssAlarmFS()
+    FastScan protocol timeout handler. In LSS_FS_PROCESSING state, if no answer
+    received, sets corresponding bit in IDNumber (bit is 1 when no node
+    matches). If BitChecked reaches 0, transitions to LSS_FS_CONFIRMATION to
+    verify identified LSS-ID sub-field. Otherwise decrements BitChecked and
+    sends next FastScan message. In LSS_FS_CONFIRMATION state, if answer
+    received, either moves to next LSS-ID subfield (LSSSub 0-2) or completes
+    protocol (LSSSub 3) by restoring parameters and setting state to
+    LSS_FINISHED. If no answer in confirmation, reports error and aborts.
+
+startLSS()
+    Placeholder function for starting LSS services. Currently empty but could
+    initialize LSS state machines and filters.
+
+stopLSS()
+    Placeholder function for stopping LSS services. Currently empty but could
+    disable LSS processing and clean up state.
+
+sendSlaveLSSMessage()
+    Constructs and transmits LSS slave response messages. Checks communication
+    state allows LSS. Creates 8-byte message with command in byte 0, COB-ID
+    0x7E4 (SLSS_ADRESS). For LSS_INQ_NODE_ID, includes node ID in byte 1. For
+    LSS_CONF_NODE_ID, LSS_CONF_BIT_TIMING, and LSS_CONF_STORE, includes error
+    code and spec error in bytes 1-2. For identity inquiries (vendor, product,
+    revision, serial), includes 32-bit value in little endian across bytes 1-4.
+    For selective responses and identification messages, sends 8-byte message
+    with only command byte. Returns result of canSend() or 0xFF if state does
+    not permit or command not implemented.
+
+CO_TranslateBaudRate()
+    Translates baud rate string to LSS table index. Currently only supports
+    "100K" returning index 0x05. Other standard rates (1M, 800K, 500K, etc) are
+    commented out. Returns 0xFF if baud rate not supported.
+
+sendMasterLSSMessage()
+    Constructs and transmits LSS master command messages. Creates 8-byte message
+    with command in byte 0, COB-ID 0x7E5 (MLSS_ADRESS). For LSS_CONF_NODE_ID,
+    includes node ID in byte 1 and expects response. For LSS_CONF_BIT_TIMING,
+    translates baud rate string, stores in byte 1 and table index in byte 2,
+    expects response. For LSS_CONF_ACT_BIT_TIMING, includes switch delay (bytes
+    1-2), stores baud rate and delay parameters, switches canHandle, sends
+    message, starts delay timer, and returns. For selective and identity
+    commands, includes 32-bit values in little endian (bytes 1-4). For
+    LSS_IDENT_FASTSCAN, if in reset state, initializes FastScan parameters from
+    dat1, otherwise uses current IDNumber/BitChecked/LSSSub/LSSNext values in
+    bytes 1-7. Sends message via canSend(). If expects response, starts message
+    timer and sets state to LSS_TRANS_IN_PROGRESS. Returns transmission result
+    or 0xFF on error.
+
+sendLSS()
+    Routes LSS message to appropriate handler based on node role. Checks
+    iam_a_slave flag. If slave, calls sendSlaveLSSMessage(). If master, calls
+    sendMasterLSSMessage(). Returns transmission result.
+
+proceedLSS_Master()
+    Processes LSS responses received by master on COB-ID 0x7E4. Validates
+    transfer state is LSS_TRANS_IN_PROGRESS (or allows unexpected messages).
+    Extracts response data based on command. For LSS_INQ_NODE_ID, reads byte 1.
+    For LSS_CONF_NODE_ID, LSS_CONF_BIT_TIMING, LSS_CONF_STORE, reads error code
+    and spec error from bytes 1-2. For identity inquiries, extracts 32-bit
+    value from bytes 1-4. For LSS_IDENT_SLAVE during FastScan, sets LSSanswer
+    flag and returns immediately. For other LSS_IDENT_SLAVE, validates against
+    expected identify remote commands. For LSS_SM_SELECTIVE_RESP, validates
+    against selective mode commands. For LSS_IDENT_NON_CONF_SLAVE, validates
+    against identify non-configured command. Stops message timer, sets state to
+    LSS_FINISHED, stores extracted data in dat1/dat2, and invokes user callback
+    if configured. Returns 0 on success, 0xFF on unexpected message.
+
+proceedLSS_Slave()
+    Processes LSS commands received by slave on COB-ID 0x7E5. For LSS_SM_GLOBAL,
+    switches between LSS_CONFIGURATION_MODE and LSS_WAITING_MODE based on byte
+    1. When entering waiting mode, checks if nodeID changed and updates state
+    accordingly. For LSS_CONF_NODE_ID in configuration mode, validates range
+    (1-127 or 0xFF) and stores in lss_transfer.nodeID, sends response with
+    error code. For LSS_CONF_BIT_TIMING in configuration mode, maps byte 2 to
+    baud rate string, sends response with error code. For
+    LSS_CONF_ACT_BIT_TIMING in configuration mode, extracts switch delay,
+    stores baud rate, updates canHandle, and starts delay timer. For
+    LSS_CONF_STORE in configuration mode, calls lss_StoreConfiguration callback
+    if configured, sends response with result. For LSS_SM_SELECTIVE_* commands
+    in waiting mode, compares received 32-bit identity value against object
+    0x1018 subindex, sets corresponding bit in addr_sel_match. When all 4 bits
+    set (0x0F), transitions to configuration mode and sends
+    LSS_SM_SELECTIVE_RESP. For LSS_IDENT_REMOTE_* commands, checks identity
+    fields match (with range checking for REV_LOW/HIGH and SERIAL_LOW/HIGH),
+    sets bits in addr_ident_match. When all 6 bits set (0x3F), sends
+    LSS_IDENT_SLAVE response. For LSS_IDENT_REMOTE_NON_CONF, sends response if
+    nodeID is 0xFF. For identity inquiries in configuration mode, reads
+    corresponding subindex from object 0x1018 and sends response. For
+    LSS_INQ_NODE_ID in configuration mode, sends current node ID. For
+    LSS_IDENT_FASTSCAN when nodeID is 0xFF, implements binary search protocol
+    by comparing received IDNumber against local identity with bit mask, sending
+    responses when bits match, and transitioning through LSS_FS_RESET,
+    LSS_FS_PROCESSING, LSS_FS_CONFIRMATION states. Returns 0 on success, 0xFF
+    on unimplemented command.
+
+configNetworkNode()
+    Master function for sending LSS command with callback notification. Stores
+    callback and command in lss_transfer structure, stops message timer
+    (commented out start), and calls sendMasterLSSMessage() to transmit command.
+    Returns transmission result.
+
+getConfigResultNetworkNode()
+    Retrieves result of previous LSS command. Copies dat1 and dat2 from
+    lss_transfer to output parameters. Returns current transfer state
+    (LSS_RESET, LSS_FINISHED, LSS_ABORTED_INTERNAL, or LSS_TRANS_IN_PROGRESS).
+
+
+main.c
+--------------------------------------------------------------------------------
+Entry point and hardware initialization for STM32U5 microcontroller. Configures
+all peripherals and enters main application loop.
+
+SystemClock_Config()
+    Configures system clocks to run at maximum performance. Sets up HSI
+    oscillator at 160 MHz, configures PLL to generate system clock, sets AHB
+    prescaler to divide by 1, APB1 prescaler to divide by 1, APB2 prescaler to
+    divide by 1, and APB3 prescaler to divide by 1. This provides 160 MHz
+    system clock for optimal performance.
+
+MX_GPIO_Init()
+    Initializes all GPIO pins used by application. Configures clock enable GPIO
+    (DVDD_EMG_EN) as output initially low for Intan power control. Configures
+    LED GPIO (PC4_LED) as output for status indication. Sets all other unused
+    pins to analog mode to reduce power consumption.
+
+MX_GPDMA1_Init()
+    Enables GPDMA1 peripheral clock and configures interrupt priorities for all
+    DMA channels used. Sets priority 0,0 for channels 8 (UART TX), 9 (SPI1 TX),
+    10 (SPI3 RX), and 11 (SPI2 RX). Enables interrupts for all channels.
+
+MX_FDCAN1_Init()
+    Configures FDCAN peripheral for CANopen communication at 125 kbps nominal
+    bit rate. Sets up frame format for classic CAN (not FD), enables
+    transmit pause feature, configures TX delay compensation, and sets message
+    RAM offsets. Initializes filter to accept all messages in range 0x000-0x7FF
+    (standard identifiers). Enables receive FIFO 0 watermark and message
+    pending interrupts. Starts FDCAN peripheral.
+
+MX_ICACHE_Init()
+    Enables instruction cache to improve CPU performance when executing code
+    from flash memory. Uses default 2-way set associative configuration.
+
+MX_SPI1_Init()
+    Configures SPI1 as master for transmitting commands to Intan RHD2164 chip.
+    Sets polarity high, phase 1-edge, NSS software controlled, MSB first, CRC
+    disabled, FIFO threshold 1 data, 16-bit data size, simplex master transmit
+    direction. Configures autonomous mode as disabled.
+
+MX_SPI2_Init()
+    Configures SPI2 as slave for receiving data from Intan MISO A line. Sets
+    polarity high, phase 1-edge, NSS software controlled, MSB first, CRC
+    disabled, FIFO threshold 1 data, 16-bit data size, simplex slave receive
+    direction. Configures autonomous mode trigger as disabled. Links to
+    GPDMA1_Channel11 for DMA reception.
+
+MX_SPI3_Init()
+    Configures SPI3 as slave for receiving data from Intan MISO B line. Sets
+    polarity high, phase 2-edge (opposite from SPI2), NSS software controlled,
+    MSB first, CRC disabled, FIFO threshold 1 data, 16-bit data size, simplex
+    slave receive direction. Configures autonomous mode trigger as disabled.
+    Links to GPDMA1_Channel10 for DMA reception.
+
+MX_TIM6_Init()
+    Configures TIM6 for CANopen timer services. Sets prescaler to 1599 (divide
+    by 1600) and period to 65535 for 100 microsecond resolution. Enables timer
+    interrupt, starts timer in interrupt mode, disables counter, sets count to
+    1, and invokes SetAlarm() to begin CANopen timer callbacks.
+
+main()
+    Entry point. Calls HAL_Init() for STM32 HAL initialization, configures
+    system clock, initializes all GPIO, GPDMA1, SPI, TIM6, FDCAN, and ICACHE.
+    Calls initAppTask() for application-level initialization. Enters infinite
+    loop calling updateAppTask() repeatedly to process sampling and
+    communication tasks.
+
+
+nmtMaster.c
+--------------------------------------------------------------------------------
+Provides Network Management (NMT) master functions for controlling operational
+state of slave nodes on CANopen network.
+
+masterSendNMTstateChange()
+    Transmits NMT state change command to specified slave node. Creates 2-byte
+    message with COB-ID 0x0000, command specifier (cs) in byte 0, and target
+    node ID in byte 1. Node ID of 0 broadcasts to all nodes. Returns result of
+    canSend() transmission (0 on success, 1 on error).
+
+masterSendNMTnodeguard()
+    Requests node guarding response from slave. Creates 1-byte RTR (remote
+    transmission request) message with COB-ID 0x700 + Node_ID. Slave responds
+    with its current state. Returns result of canSend() transmission.
+
+masterRequestNodeState()
+    Higher level function combining node guard request with callback. Stores
+    callback pointer and target node ID in NMTable, sets timeout using
+    heartbeat time from consumer heartbeat configuration, and sends node guard
+    request via masterSendNMTnodeguard(). Returns 0.
+
+
+nmtSlave.c
+--------------------------------------------------------------------------------
+Implements NMT slave functionality for processing state change commands from
+master and managing node operational modes.
+
+processNMTstateChange()
+    Processes received NMT command. Validates node is not in Hibernate or
+    BootCheckReset states. Checks if command targets this node (byte 1 is 0 for
+    broadcast or matches bDeviceNodeId). Switches on command byte 0 to handle
+    NMT_Start_Node, NMT_Stop_Node, NMT_Enter_Pre_Operational (treated as enter
+    waiting), and custom commands NMT_Enter_Patient_Operation, NMT_Enter_X_Manual,
+    NMT_Enter_Y_Manual, NMT_Enter_Stop_Stim, NMT_Enter_Patient_Manual,
+    NMT_Produce_X_Manual, NMT_Enter_Record_X. Each command calls corresponding
+    function pointer (StartNodesFunc, StopNodesFunc, EnterWaitingFunc, etc)
+    stored in CO_Data structure to allow application-specific handling.
+
+
+objacces.c
+--------------------------------------------------------------------------------
+Provides functions for accessing CANopen object dictionary entries with type
+checking and validation.
+
+accessDictionaryError()
+    Logs object dictionary access errors when DEBUG_WAR_CONSOLE_ON is defined.
+    Prints index, subindex, and specific error code (OD_NO_SUCH_OBJECT,
+    OD_NO_SUCH_SUBINDEX, OD_WRITE_NOT_ALLOWED, OD_LENGTH_DATA_INVALID,
+    OD_NOT_MAPPABLE, OD_VALUE_TOO_LOW, OD_VALUE_TOO_HIGH) with descriptive
+    messages. Used for debugging dictionary access problems during development.
+
+_getODentry()
+    Low-level function to read object dictionary entry. Searches objdict array
+    using binary search (scanIndexOD) to find index. Validates subindex exists.
+    Checks read access is allowed. Retrieves data pointer, size, and type from
+    pSubindex structure. Returns OD_SUCCESSFUL or appropriate error code
+    (OD_NO_SUCH_OBJECT, OD_NO_SUCH_SUBINDEX, OD_WRITE_NOT_ALLOWED).
+
+_setODentry()
+    Low-level function to write object dictionary entry. Searches for index,
+    validates subindex. Checks write access allowed (not read-only, not const).
+    If size provided matches expected size or is 0 (for strings), copies data
+    from src to pObject. Calls registered callback if exists. Checks endianize
+    flag to determine if byte swapping needed for multi-byte types. Returns
+    OD_SUCCESSFUL or error code (OD_NO_SUCH_OBJECT, OD_NO_SUCH_SUBINDEX,
+    OD_WRITE_NOT_ALLOWED, OD_LENGTH_DATA_INVALID, OD_VALUE_RANGE_EXCEEDED).
+
+readLocalDict()
+    Wrapper for _getODentry() that handles size validation and type checking.
+    Calls _getODentry() to retrieve data. If successful, validates returned
+    size matches expected size for fixed-size types. For variable types
+    (strings, domains), allows size mismatch. Returns error code from
+    _getODentry() or OD_LENGTH_DATA_INVALID if size mismatch.
+
+writeLocalDict()
+    Wrapper for _setODentry() that handles endianness and validation. Calls
+    _setODentry() with checkAccess flag to validate write permission and data
+    range. Uses endianize parameter to control byte swapping for network byte
+    order. Returns error code from _setODentry().
+
+
+pdo.c
+--------------------------------------------------------------------------------
+Implements Process Data Object protocol for efficient periodic data exchange
+without SDO overhead.
+
+buildPDO()
+    Constructs PDO message from mapped object dictionary entries. Retrieves
+    TPDO communication parameters from objdict at firstIndex->PDO_TRS + numPdo
+    to get COB-ID (subindex 1). Retrieves TPDO mapping parameters from
+    firstIndex->PDO_TRS_MAP + numPdo to get number of mapped objects (subindex
+    0). Iterates through each mapping entry (up to 8), extracting mapping
+    parameter (32-bit value encoding index, subindex, and bit length). Reads
+    mapped object data from dictionary, copies into message data buffer at
+    calculated offset. Handles bit-level packing for objects not aligned to byte
+    boundaries. Sets message length based on total bits mapped divided by 8.
+    Returns 0 on success, 0xFF on error.
+
+sendPDOrequest()
+    Transmits PDO request to specified node. Creates 2-byte message with remote
+    COB-ID and RTR flag set. Returns result of canSend() transmission.
+
+proceedPDO()
+    Processes received PDO message. Extracts COB-ID, determines if transmit or
+    receive PDO based on COB-ID range. For receive PDOs, retrieves mapping
+    parameters and unpacks data into object dictionary entries. For transmit
+    PDO requests (RTR), calls sendPDO() to respond. Returns status code.
+
+sendPDOevent()
+    Triggers event-driven PDO transmission. Searches through TPDO communication
+    parameters for PDOs configured with transmission type 255 (event-driven).
+    For each event PDO, calls buildPDO() and canSend() to transmit. Returns
+    number of PDOs sent.
+
+_sendPDOevent()
+    Internal function called during SYNC processing. If isSyncEvent flag set,
+    processes synchronous PDOs (transmission types 0-240). Otherwise processes
+    event-driven PDOs. Returns 0.
+
+PDOInit()
+    Initializes PDO subsystem. Registers callbacks for changes to TPDO and
+    RPDO communication parameters and mapping parameters. Enables PDO
+    processing.
+
+PDOStop()
+    Stops PDO processing. Unregisters callbacks and disables PDO communication.
+
+
+sdo.c
+--------------------------------------------------------------------------------
+Implements Service Data Object protocol for reading and writing object
+dictionary entries on remote nodes.
+
+_writeNetworkDict()
+    Initiates SDO download (write) to remote node. Allocates free SDO line,
+    stores parameters (node ID, index, subindex, count, data type). Constructs
+    SDO request based on data size (expedited for <=4 bytes, segmented for
+    larger). Sends initial request with command specifier, byte count,
+    index/subindex, and data. Stores callback for completion notification.
+    Starts SDO timeout timer. Returns 0 on success, 0xFF if no free SDO line.
+
+_readNetworkDict()
+    Initiates SDO upload (read) from remote node. Allocates free SDO line,
+    stores parameters. Constructs SDO upload request with command specifier and
+    index/subindex. Sends request. Stores callback. Starts timeout timer.
+    Returns 0 on success, 0xFF if no free line.
+
+sendSDO()
+    Transmits SDO message. Sets COB-ID based on client/server role and node ID
+    (0x600 + nodeId for client-to-server, 0x580 + nodeId for server-to-client).
+    Copies data into message buffer. Returns result of canSend() transmission.
+
+proceedSDO()
+    Processes received SDO message. Extracts whoami (node ID from COB-ID).
+    Distinguishes between client and server messages. For server messages,
+    processes download (write) requests by validating index/subindex, checking
+    access rights, and storing data. Sends response indicating success or abort
+    code. For segmented downloads, manages toggle bit and accumulates data
+    across segments. For upload (read) requests, retrieves data from local
+    dictionary and sends response. For client messages, matches with pending
+    SDO line by index/subindex, validates response, extracts data, invokes
+    callback, and frees SDO line. Handles abort codes from server. Returns 0xFF
+    on error, 0 on success.
+
+initSDOline()
+    Initializes SDO line structure. Sets state to SDO_RESET, clears all
+    parameters (index, subindex, count, offset), and nullifies data and callback
+    pointers. Called during initialization and after SDO completion/abort.
+
+resetSDOline()
+    Resets specific SDO line to idle state. Calls initSDOline() to clear all
+    fields. Stops associated timer if running.
+
+resetSDO()
+    Resets all SDO lines. Iterates through SDO_MAX_SIMULTANEOUS_TRANSFERS
+    entries in transfers array, calling resetSDOline() for each to return all
+    SDO state machines to idle.
+
+getSDOfreeLine()
+    Searches for available SDO line. Iterates through transfers array looking
+    for entry with state SDO_RESET. Returns index of free line, or 0xFF if all
+    lines busy.
+
+getSDOlineOnUse()
+    Finds active SDO line matching node ID and index/subindex. Searches through
+    transfers array comparing nodeId, index, and subindex. Returns index of
+    matching line, or 0xFF if not found.
+
+closeSDOtransfer()
+    Completes SDO transfer. Stops timeout timer. Sets state to SDO_FINISHED.
+    If callback registered, invokes with result code. Resets SDO line.
+
+getSDOlineRestBytes()
+    Calculates remaining bytes for segmented transfer. Computes count - offset
+    to determine how many bytes left to send/receive. Returns bytes remaining.
+
+setSDOlineRestBytes()
+    Updates offset for segmented transfer. Adds nbBytes to current offset to
+    track progress through multi-segment transfer.
+
+sendSDOabort()
+    Transmits SDO abort message. Creates 8-byte message with abort command
+    specifier (0x80), index/subindex, and 4-byte abort code in little endian.
+    Sends via sendSDO(). Returns transmission result.
+
+failedSDO()
+    Handles SDO failure. Sends abort message if sdo parameter non-null.
+    Otherwise closes transfer without abort (used for timeout). Resets SDO line.
+
+getReadResultNetworkDict()
+    Retrieves result of previous SDO read. Checks SDO line state. If finished,
+    copies data to output buffer and size to abortCode parameter. If still in
+    progress, returns SDO_UPLOAD_IN_PROGRESS. Returns state.
+
+getWriteResultNetworkDict()
+    Retrieves result of previous SDO write. Checks SDO line state. Returns
+    state (SDO_RESET, SDO_FINISHED, SDO_ABORTED_INTERNAL,
+    SDO_DOWNLOAD_IN_PROGRESS).
+
+
+st32/can_stm.c
+--------------------------------------------------------------------------------
+STM32-specific FDCAN driver implementation. Bridges CANopen stack to hardware.
+
+canInit()
+    Initializes CAN filters and transmission headers. Reads RPDO COB-IDs from
+    object dictionary (indices 0x1400-0x1403 subindex 1) to configure receive
+    filters. Sets up TxHeader with standard ID type and node ID as identifier.
+    Returns 1 on success.
+
+UpdateCANerrors()
+    Copies local error counters to object dictionary. Updates CAN_BitErrors,
+    CAN_StuffErrors, CAN_FormErrors, CAN_OtherErrors, CAN_Rx_ErrCounter, and
+    CAN_Tx_ErrCounter from volatile counters incremented in error callback.
+    Allows CANopen stack to report error statistics.
+
+canSend()
+    Transmits CAN message via FDCAN peripheral. Checks if ENABLE_CAN_TRANSMISSION
+    macro is defined (compile-time control). Verifies TX FIFO has free space.
+    Copies message parameters to TxHeader (COB-ID, frame type, data length).
+    Copies data bytes to TxData buffer. Calls HAL_FDCAN_AddMessageToTxFifoQ()
+    to queue message. Increments CAN_Transmit_Messages counter on success.
+    Returns 1 if transmitted, 0 if FIFO full or error, or 1 immediately if
+    transmission disabled at compile time.
+
+HAL_FDCAN_RxFifo0Callback()
+    Interrupt callback when message arrives in RX FIFO 0. Checks interrupt
+    source. If FDCAN_IT_RX_FIFO0_MESSAGE_LOST, increments error counter and
+    clears interrupt flag. For FDCAN_IT_RX_FIFO0_NEW_MESSAGE, retrieves message
+    from FIFO using HAL_FDCAN_GetRxMessage(). Increments CAN_Receive_Messages
+    counter. Validates standard ID type. Constructs CANopen Message structure
+    with COB-ID, RTR flag, length, and data. Calls canDispatch() to route
+    message to appropriate CANopen protocol handler. Updates error counters.
+
+HAL_FDCAN_RxFifo1Callback()
+    Interrupt callback for RX FIFO 1. Retrieves message and increments counter
+    but does not process (FIFO 1 unused in current configuration).
+
+HAL_FDCAN_ErrorCallback()
+    Interrupt callback when FDCAN error detected. Checks ErrorCode field for
+    specific protocol errors. Increments BitErrors for bit errors (dominant/
+    recessive), StuffErrors for bit stuffing violations, FormErrors for frame
+    format errors, OtherErrors for CRC, ACK, timeout, initialization, and
+    parameter errors. Increments CAN_TotalErrors. Clears ErrorCode field.
+
+canChangeBaudRate_driver()
+    Placeholder for baud rate change. Currently returns 0 without performing
+    operation. Would need to stop FDCAN, reconfigure bit timing registers, and
+    restart for runtime baud rate changes.
+
+
+st32/timer_stm.c
+--------------------------------------------------------------------------------
+STM32-specific timer implementation for CANopen alarm system and sampling
+trigger.
+
+HAL_TIM_PeriodElapsedCallback()
+    Called when timer period expires. If TIM6 instance, clears last_time_set
+    and elapsed_time counters, clears update interrupt flag, and calls
+    TimeDispatch() to process expired CANopen timers. If TIM2 instance, calls
+    start_spi_transfers() to initiate next sampling cycle for Intan ADC data
+    acquisition.
+
+setTimer()
+    Configures TIM6 period for next CANopen timer expiration. Converts time
+    value from microseconds to timer ticks (value * 10 for 100us resolution).
+    Clamps to maximum 65535. Writes to TIM6->ARR register to set auto-reload
+    value. Resets counter to 0 to start new timing period.
+
+getElapsedTime()
+    Returns microseconds elapsed since last timer set. Reads TIM6->CNT counter
+    value and divides by 10 (100us tick period) to convert to microseconds.
+    Returns TIMEVAL (32-bit) representing elapsed time.
+
+
+states.c
+--------------------------------------------------------------------------------
+Manages CANopen state machine and communication state transitions.
+
+getState()
+    Returns current nodeState from CO_Data structure. Possible values include
+    Initialisation, Pre-operational, Operational, Stopped, Waiting, Hibernate,
+    Mode_Patient_Control, Mode_X_Manual, Mode_Y_Manual, Mode_Patient_Manual,
+    Mode_Produce_X_Manual, Mode_Record_X.
+
+canDispatch()
+    Routes received CAN messages to appropriate protocol handler. Extracts
+    COB-ID and shifts by 7 to get function code. Switches on function code to
+    dispatch to SYNC/EMCY (0x080 for SYNC, others for EMCY), BOOT (0x140),
+    PDO (PDO1tx-PDO4rx ranges), SDO (SDOtx/SDOrx), NODE_GUARD (heartbeat/node
+    guarding), NMT (node management), or LSS (layer setting services). Each
+    case checks communication state flags (csSYNC, csEmergency, csPDO, csSDO,
+    csHeartbeat, csLSS) to ensure protocol enabled before calling handler
+    (processSYNC, proceedEMCY, processPDO, processSDO, processNODE_GUARD,
+    processNMTstateChange, proceedLSS_Slave/Master). For NMT, also checks for
+    NMT_Enter_Bootloader command (0x7F) and triggers system reset via
+    NVIC_SystemReset() if received.
+
+switchCommunicationState()
+    Enables or disables individual communication services. Uses StartOrStop
+    macro to compare newCommunicationState flags with CurrentCommunicationState.
+    For each service (csLSS, csSDO, csSYNC, csHeartbeat, csEmergency, csPDO,
+    csBoot_Up), if transition from 0 to 1, calls start function (startLSS,
+    startSYNC, heartbeatInit, emergencyInit, PDOInit, slaveSendBootUp). If
+    transition from 1 to 0, calls stop function (stopLSS, resetSDO, stopSYNC,
+    heartbeatStop, emergencyStop, PDOStop). Updates CurrentCommunicationState
+    to reflect new settings.
+
+setState()
+    Transitions node to new operational state. If newState differs from current
+    nodeState, creates s_state_communication structure with appropriate flag
+    settings for each state. For Mode_Patient_Control, Mode_X_Manual,
+    Mode_Y_Manual, Mode_Patient_Manual, Mode_Produce_X_Manual, Mode_Record_X,
+    enables all services except boot_Up and LSS. For Waiting and Stopped,
+    disables SYNC and PDO but keeps SDO, emergency, and heartbeat enabled.
+    Calls switchCommunicationState() to apply changes. Invokes state-specific
+    callback (waiting, stopped) if defined. Updates nodeState. Returns final
+    state value.
+
+getNodeId()
+    Returns node ID from bDeviceNodeId pointer in CO_Data structure. Node ID
+    ranges from 1-127 or 0xFF for unconfigured.
+
+setNodeId()
+    Updates node ID and reconfigures COB-IDs throughout object dictionary. Stores
+    nodeId in lss_transfer (if LSS enabled) and bDeviceNodeId. Validates range
+    (1-127 or 0xFF). Updates SDO server COB-IDs at offset SDO_SVR (0x600 +
+    nodeId for client-to-server, 0x580 + nodeId for server-to-client). Updates
+    transmit PDO COB-IDs at indices PDO_TRS through PDO_TRS+3 (0x180/0x280/
+    0x380/0x480 + nodeId). Updates EMCY COB-ID if currently at default
+    (0x80 + old nodeId) to new value (0x80 + nodeId). Writes nodeId to
+    bDeviceNodeId.
+
+_mode_X_Manual()
+    Weak placeholder for Mode_X_Manual state entry. Application can override to
+    implement mode-specific initialization.
+
+_mode_Y_Manual()
+    Weak placeholder for Mode_Y_Manual state entry. Application can override.
+
+_waiting()
+    Weak placeholder for Waiting state entry. Application can override.
+
+_stopped()
+    Weak placeholder for Stopped state entry. Application can override.
+
+_mode_Patient_Manual()
+    Weak placeholder for Mode_Patient_Manual state entry. Application can override.
+
+_mode_Patient_Control()
+    Weak placeholder for Mode_Patient_Control state entry. Application can override.
+
+
+stm32u5xx_hal_msp.c
+--------------------------------------------------------------------------------
+Hardware abstraction layer peripheral-specific initialization (MSP = MCU Support
+Package). Configures clocks, GPIOs, DMA, and interrupts for each peripheral.
+
+HAL_FDCAN_MspInit()
+    Initializes FDCAN peripheral hardware. Selects peripheral clock source
+    (HSE or PLL), enables FDCAN1 clock, enables GPIOB clock for AF pins,
+    configures PB8 (FDCAN1_RX) and PB9 (FDCAN1_TX) as alternate function 9 with
+    high speed. Sets FDCAN1_IT0 interrupt priority to 0,0 and enables interrupt
+    in NVIC.
+
+HAL_FDCAN_MspDeInit()
+    Releases FDCAN hardware resources. Disables FDCAN1 clock, deinitializes
+    GPIO pins PB8 and PB9, disables FDCAN1_IT0 interrupt in NVIC.
+
+HAL_SPI_MspInit()
+    Configures SPI hardware for SPI1, SPI2, and SPI3. For SPI1, selects system
+    clock as source, enables SPI1 clock, configures GPIO PA15 (NSS), PG4 (MOSI),
+    PG2 (SCK), PG3 (MISO) as alternate function 5, initializes
+    GPDMA1_Channel9 for TX DMA (memory to peripheral, 16-bit width, normal
+    mode, low priority), links DMA to hspi1 TX handle, sets non-privileged
+    channel attributes, configures SPI1 interrupt priority 0,0 and enables. For
+    SPI2, selects system clock, enables SPI2 clock, configures PB13 (SCK) and
+    PB14 (MISO) as AF5, initializes GPDMA1_Channel11 for RX DMA (peripheral to
+    memory, 16-bit width), links to hspi2 RX handle, sets interrupt priority
+    0,0 and enables. For SPI3, selects system clock, enables SPI3 clock,
+    configures PB4 (MISO) as AF6 and PG9 (SCK) as AF6, initializes
+    GPDMA1_Channel10 for RX DMA, links to hspi3 RX handle, sets interrupt
+    priority 0,0 and enables.
+
+HAL_SPI_MspDeInit()
+    Releases SPI hardware resources. For each SPI (1/2/3), disables clock,
+    deinitializes GPIO pins, deinitializes associated DMA channel, and disables
+    interrupt in NVIC.
+
+HAL_TIM_Base_MspInit()
+    Initializes timer hardware. For TIM6, enables clock and configures interrupt
+    priority 0,0 and enables in NVIC.
+
+HAL_TIM_Base_MspDeInit()
+    Releases timer hardware. Disables clock and interrupt for TIM6.
+
+HAL_UART_MspInit()
+    Configures UART hardware. Selects system clock as source, enables USART1
+    clock, configures PA9 (TX) and PA10 (RX) as AF7, initializes
+    GPDMA1_Channel8 for TX DMA (peripheral to memory, byte width, normal mode,
+    low priority), links to huart TX handle, sets non-privileged channel,
+    configures USART1 interrupt priority 0,0 and enables.
+
+HAL_UART_MspDeInit()
+    Releases UART hardware. Disables USART1 clock, deinitializes GPIO PA9 and
+    PA10, deinitializes DMA channel 8, and disables USART1 interrupt.
+
+
+stm32u5xx_it.c
+--------------------------------------------------------------------------------
+Interrupt service routines for STM32 exceptions and peripheral interrupts.
+
+NMI_Handler()
+    Non-maskable interrupt handler. Empty function for handling critical system
+    errors.
+
+HardFault_Handler()
+    Hard fault exception handler. Enters infinite loop to halt system for
+    debugging when CPU encounters unrecoverable error.
+
+MemManage_Handler()
+    Memory management fault handler. Infinite loop on MPU violation or invalid
+    memory access.
+
+BusFault_Handler()
+    Bus fault handler. Infinite loop on instruction fetch or data access error
+    on bus.
+
+UsageFault_Handler()
+    Usage fault handler. Infinite loop on undefined instruction, unaligned
+    access, or divide by zero.
+
+SVC_Handler()
+    Supervisor call handler. Empty placeholder for RTOS system calls.
+
+DebugMon_Handler()
+    Debug monitor handler. Empty placeholder for debug events.
+
+PendSV_Handler()
+    PendSV handler. Empty placeholder for RTOS context switching.
+
+SysTick_Handler()
+    System tick timer handler. Calls HAL_IncTick() to increment millisecond
+    tick counter used by HAL delay functions.
+
+GPDMA1_Channel8_IRQHandler()
+    DMA channel 8 interrupt for UART TX. Calls HAL_DMA_IRQHandler() with
+    handle_GPDMA1_Channel8 to process transfer complete and error events.
+    Eventually triggers HAL_UART_TxCpltCallback() in serial_interface.c.
+
+GPDMA1_Channel9_IRQHandler()
+    DMA channel 9 interrupt for SPI1 TX. Calls HAL_DMA_IRQHandler() with
+    handle_GPDMA1_Channel9 to process SPI1 command transmission completion.
+
+GPDMA1_Channel10_IRQHandler()
+    DMA channel 10 interrupt for SPI3 RX (MISO B). Calls HAL_DMA_IRQHandler()
+    with handle_GPDMA1_Channel10. Eventually triggers HAL_SPI_RxCpltCallback()
+    in sampling.c when MISO B data reception completes.
+
+GPDMA1_Channel11_IRQHandler()
+    DMA channel 11 interrupt for SPI2 RX (MISO A). Calls HAL_DMA_IRQHandler()
+    with handle_GPDMA1_Channel11. Eventually triggers HAL_SPI_RxCpltCallback()
+    in sampling.c when MISO A data reception completes.
+
+TIM2_IRQHandler()
+    Timer 2 interrupt for sampling trigger. Calls HAL_TIM_IRQHandler() with
+    htim2 handle. Eventually triggers HAL_TIM_PeriodElapsedCallback() in
+    timer_stm.c which calls start_spi_transfers() to initiate next ADC
+    conversion cycle.
+
+TIM6_IRQHandler()
+    Timer 6 interrupt for CANopen timers. Calls HAL_TIM_IRQHandler() with htim6
+    handle. Eventually triggers HAL_TIM_PeriodElapsedCallback() in timer_stm.c
+    which calls TimeDispatch() to process expired CANopen alarms.
+
+SPI1_IRQHandler()
+    SPI1 interrupt handler. Calls HAL_SPI_IRQHandler() with hspi1 for error
+    handling.
+
+SPI2_IRQHandler()
+    SPI2 interrupt handler. Calls HAL_SPI_IRQHandler() with hspi2 for error
+    handling.
+
+SPI3_IRQHandler()
+    SPI3 interrupt handler. Calls HAL_SPI_IRQHandler() with hspi3 for error
+    handling.
+
+FDCAN1_IT0_IRQHandler()
+    FDCAN interrupt handler. Calls HAL_FDCAN_IRQHandler() with hfdcan1. Routes
+    to HAL_FDCAN_RxFifo0Callback() for receive events and
+    HAL_FDCAN_ErrorCallback() for error events in can_stm.c.
+
+USART1_IRQHandler()
+    USART1 interrupt handler. Calls HAL_UART_IRQHandler() with huart1. Routes
+    to HAL_UART_RxCpltCallback() for command reception and
+    HAL_UART_TxCpltCallback() for transmission completion in serial_interface.c.
+
+
+sync.c
+--------------------------------------------------------------------------------
+Implements CANopen SYNC object protocol for synchronizing distributed
+application actions across network.
+
+SyncAlarm()
+    Timer callback for SYNC generation. Calls sendSYNC() to transmit SYNC
+    message and trigger local processing.
+
+OnCOB_ID_SyncUpdate()
+    Callback when object 0x1005 (SYNC COB-ID) or 0x1006 (Communication Cycle
+    Period) is modified. Restarts SYNC generation with new parameters by calling
+    startSYNC(). Returns 0.
+
+startSYNC()
+    Initializes SYNC processing. If timer already running, stops existing timer
+    via stopSYNC(). Registers callbacks for objects 0x1005 and 0x1006 to detect
+    configuration changes. Checks if COB-ID has producer bit set (bit 31) and
+    cycle period is non-zero. If both true, schedules periodic SyncAlarm timer
+    using SetAlarm() with period from Sync_Cycle_Period converted to timer
+    ticks via MS_TO_TIMEVAL().
+
+stopSYNC()
+    Stops SYNC processing. Unregisters callbacks for 0x1005 and 0x1006. Cancels
+    sync timer via DelAlarm().
+
+sendSYNCMessage()
+    Constructs and transmits SYNC message. Creates message with COB-ID from
+    COB_ID_Sync (default 0x080), RTR flag clear, and length 0 (no data bytes).
+    Returns result of canSend() transmission.
+
+sendSYNC()
+    Transmits SYNC and triggers local processing. Calls sendSYNCMessage() to
+    broadcast SYNC on network, then calls processSYNC() with NULL message
+    pointer to trigger local synchronous PDO transmission and post_sync callback.
+    Returns transmission result.
+
+processSYNC()
+    Processes SYNC event. Calls user post_sync callback for application-specific
+    synchronization actions. Checks if node is in operational state (csPDO flag
+    set). If message pointer non-NULL, calls processSYNCMessageForApp() to allow
+    application access to SYNC data payload. Calls _sendPDOevent() with
+    isSyncEvent flag set to transmit synchronous PDOs. Calls user post_TPDO
+    callback after PDO transmission. Returns result of _sendPDOevent().
+
+_post_sync()
+    Weak placeholder for application-defined SYNC processing. Called before
+    synchronous PDOs transmitted.
+
+_post_TPDO()
+    Weak placeholder for application-defined post-PDO actions. Called after
+    synchronous PDOs transmitted.
+
+
+syscalls.c
+--------------------------------------------------------------------------------
+System call stubs for newlib C library integration with embedded system.
+
+_write()
+    Redirects printf and write() calls to UART. If file descriptor is stdout
+    (1) or stderr (2), transmits data via HAL_UART_Transmit() on huart1 with
+    100ms timeout. Returns number of bytes transmitted or 0 on error.
+
+_read()
+    Stub for read() system call. Returns 0 indicating no data available.
+
+_close()
+    Stub for close() system call. Returns -1 indicating operation not supported.
+
+_lseek()
+    Stub for lseek() system call. Returns 0 indicating no seeking performed.
+
+_fstat()
+    Stub for fstat() system call. Sets st_mode to character device. Returns 0.
+
+_isatty()
+    Stub for isatty() system call. Returns 1 for stdout/stderr indicating
+    terminal device, 0 for other file descriptors.
+
+
+sysmem.c
+--------------------------------------------------------------------------------
+Dynamic memory allocation for heap management.
+
+_sbrk()
+    Allocates memory from heap. Maintains heap_ptr position between heap_start
+    and heap_end. On each call, returns current heap_ptr and increments by
+    requested incr bytes. Checks against heap_end to prevent overflow. Returns
+    pointer to allocated memory or (caddr_t)-1 on out of memory.
+
+
+system_stm32u5xx.c
+--------------------------------------------------------------------------------
+System initialization and clock configuration for STM32U5 series.
+
+SystemInit()
+    Called at startup before main(). Enables FPU by setting CPACR register bits
+    20-23 to enable CP10 and CP11 coprocessors. Enables instruction cache via
+    ICACHE_CR. Enables data cache via DCACHE1_CR. Resets RCC clock configuration
+    to default state. Disables interrupts. Relocates vector table if
+    VECT_TAB_SRAM defined, otherwise uses flash base address. Configures
+    systick priority.
+
+SystemCoreClockUpdate()
+    Updates SystemCoreClock variable with current clock frequency. Reads RCC
+    clock configuration registers (CFGR, PLLCFGR) to determine system clock
+    source (HSI, HSE, MSI, PLL). Calculates PLL output frequency based on input
+    source, M/N/R dividers. Applies AHB prescaler to compute final core clock.
+    Stores result in SystemCoreClock global variable (in Hz) for use by HAL and
+    application.
+
+
+timer.c
+--------------------------------------------------------------------------------
+CANopen software timer management. Provides alarm scheduling for protocol
+timeouts and periodic tasks.
+
+SetAlarm()
+    Schedules alarm callback to execute after specified delay. Searches timers
+    array for free slot (state TIMER_FREE). Allocates row by storing callback,
+    CO_Data pointer, id, expiration value (current time + value), interval for
+    periodic operation, and state TIMER_ARMED. Updates last_timer_raw if
+    allocating beyond previous max. Calls getElapsedTime() to get current time.
+    Computes real timer value clamped to TIMEVAL_MAX. If new alarm expires
+    sooner than total_sleep_time, updates total_sleep_time and calls setTimer()
+    to reprogram hardware timer. Returns timer handle (array index) or
+    TIMER_NONE if all slots occupied.
+
+DelAlarm()
+    Cancels scheduled alarm. Validates handle not TIMER_NONE. Sets timer state
+    to TIMER_FREE to release slot. If handle equals last_timer_raw, decrements
+    last_timer_raw to optimize future searches. Note that hardware timer
+    continues running but no action occurs when timer expires since slot marked
+    free. Returns TIMER_NONE.
+
+TimeDispatch()
+    Processes expired timers. Called from HAL_TIM_PeriodElapsedCallback() when
+    TIM6 period elapses. Computes overrun (actual elapsed time since last
+    dispatch) and total sleep time. Iterates through all timers. For each ARMED
+    timer, checks if val <= total sleep time. If expired and non-periodic,
+    marks TIMER_TRIG. If expired and periodic, resets val to interval minus
+    overrun modulo interval, marks TIMER_TRIG_PERIOD, and updates next_wakeup.
+    If not expired, decrements val by total sleep time and updates next_wakeup
+    if sooner. After first pass, sets total_sleep_time to next_wakeup and calls
+    setTimer() to reprogram hardware for next expiration. Second pass iterates
+    through timers again, invoking callback for any marked TIMER_TRIG, then
+    clearing trig bit (non-periodic timers become TIMER_FREE, periodic remain
+    TIMER_ARMED).
+
+
+module/app.c
+--------------------------------------------------------------------------------
+Main application coordination layer. Initializes all subsystems and manages
+Intan RHD2164 biopotential amplifier chip configuration.
+
+initAppTask()
+    Entry point for application initialization called from main.c after hardware
+    setup. Calls MX_TIM2_Init() to configure sampling timer, MX_USART1_UART_Init()
+    for serial communication. Registers update_sampling_parameters() callback
+    with object dictionary index 0x3A00 subindex 0x01 for sample rate changes.
+    Enables Intan power supply via GPIO DVDD_EMG_EN pin set high. Waits 500ms
+    for power stabilization. Calls setup_intan() to configure amplifier
+    registers and calibrate ADC. Calls start_sampling_timer() to begin periodic
+    ADC conversions (previously commented out, now enabled).
+
+updateAppTask()
+    Main application loop function called repeatedly from main.c infinite loop.
+    Executes scan_monitor_process() to check for completed ADC conversions and
+    trigger data processing/transmission.
+
+setup_intan()
+    Configures Intan RHD2164 chip registers via SPI1. Transmits two dummy read
+    commands (READREG63) to clear startup transients. Sequentially writes
+    configuration to registers 0-21 using predefined values (REG0CONFIG through
+    REG21CONFIG). Register settings include ADC configuration with fast settle
+    enabled (R0), buffer bias currents (R1), MUX settings with temperature
+    sensor disabled (R2-R3), impedance check DAC and control registers set to
+    disable impedance measurement (R4-R7), upper bandwidth 7.5 kHz (R8-R9),
+    lower bandwidth 1 Hz (R10-R13), and all 64 channels powered up (R14-R21,
+    each register controls 8 channels with 0xFF enabling all). Transmits
+    CALIBRATE command to start ADC offset calibration. Sends 9 dummy reads to
+    allow 9 conversion cycles for calibration completion per datasheet timing.
+    Primes conversion pipeline with two CH0CONVERT commands to establish steady
+    state. Uses blocking HAL_SPI_Transmit() with 100ms timeout for all
+    operations.
+
+processSYNCMessageForApp()
+    Processes SYNC message data if application needs to extract information from
+    8-byte SYNC payload. Currently sets f_syncPulse flag to 1 as example. Can
+    be extended to parse command data embedded in SYNC messages from master.
+
+sleepApplication()
+    Placeholder for entering low power mode. Would disable peripherals and enter
+    sleep/standby when NMT sleep command received.
+
+InitAppTaskValues()
+    Resets application state variables. Clears f_syncPulse flag. Called when
+    entering Stopped or Waiting states to ensure clean initialization.
+
+StartNodesFunc()
+    NMT handler for Start Node command. If currently in Hibernate state,
+    transitions to Waiting via setState(). Otherwise transitions to Unknown_state
+    indicating unexpected command for current state.
+
+StopNodesFunc()
+    NMT handler for Stop Node command. Unconditionally transitions to Stopped
+    state via setState(). Calls InitAppTaskValues() to reset application flags.
+
+EnterWaitingFunc()
+    NMT handler for Enter Waiting command. Unconditionally transitions to Waiting
+    state. Stops watchdog timer via StopWatchDog(). Resets application values
+    via InitAppTaskValues().
+
+EnterPatientOperationFunc()
+    NMT handler for custom Enter Patient Operation command. Validates node is in
+    Waiting state and command is broadcast (data byte 1 is 0). If both true,
+    transitions to Mode_Patient_Control operational mode.
+
+EnterXManualFunc()
+    NMT handler for custom Enter X Manual command. Validates node in Waiting
+    state. If true, transitions to Mode_X_Manual and starts watchdog timer with
+    10 second timeout via StartWatchDog().
+
+EnterYManualFunc()
+    NMT handler for custom Enter Y Manual command. Validates node in Waiting
+    state. Transitions to Mode_Y_Manual and starts 10 second watchdog.
+
+EnterStopStimFunc()
+    NMT handler for custom Enter Stop Stim command. Unconditionally transitions
+    to Stopped state and resets application values.
+
+EnterPatientManualFunc()
+    NMT handler for custom Enter Patient Manual command. Validates Waiting state
+    and broadcast command. Transitions to Mode_Patient_Manual and starts 10
+    second watchdog.
+
+EnterProduceXManualFunc()
+    NMT handler for custom Produce X Manual command. Validates Waiting state and
+    broadcast. Transitions to Mode_Produce_X_Manual operational mode.
+
+EnterRecordXFunc()
+    NMT handler for custom Enter Record X command. Validates Waiting state.
+    Transitions to Mode_Record_X operational mode.
+
+
+module/eedata.c
+--------------------------------------------------------------------------------
+Emulated EEPROM implementation using STM32 flash memory. Provides non-volatile
+storage for object dictionary parameters.
+
+CheckRestoreFlag()
+    Determines if EEPROM contains valid data. Reads first 2 bytes from EEPROM
+    address 0x00. If both bytes are 0xFF (erased) or both 0x00, returns 0
+    indicating EEPROM empty and RestoreValues() should not execute. Otherwise
+    returns 1 indicating valid data exists.
+
+SaveValues()
+    Persists object dictionary entries to EEPROM. Opens EEPROM for modification
+    via EEPROM_open(). Iterates through RestoreList array containing indices to
+    save (defined in ObjDict). Skips indices below 0x1018 to ensure proper
+    subindex structure. For each index, reads subindex 0 to get number of
+    subindices (nSubIndices). Validates subindex 0 is uint8 type. Iterates
+    through subindices 1 to nSubIndices, reading data from object dictionary via
+    readLocalDict(). Writes data bytes sequentially to EEPROM via EEPROM_write()
+    starting at address 2 (first 2 bytes reserved for size). Tracks total bytes
+    written in counter. After processing all indices, writes counter value to
+    addresses 0-1 as 16-bit little endian size. Commits changes to flash via
+    EEPROM_commit(). Takes approximately 9ms per byte due to flash write timing.
+
+RestoreValues()
+    Loads saved object dictionary values from EEPROM. Iterates through RestoreList
+    (same as SaveValues). For each index above 0x1018, reads subindex 0 to get
+    nSubIndices. For each subindex 1 to nSubIndices, reads current size from
+    object dictionary to determine expected length. Reads corresponding bytes
+    from EEPROM sequentially starting at address 2. Writes retrieved data back
+    to object dictionary via writeLocalDict(). Advances counter by size for each
+    subindex. Must match exact sequence used by SaveValues() since indices and
+    subindices not stored, only raw data bytes.
+
+ResetToODDefault()
+    Clears EEPROM to force object dictionary defaults on next boot. Opens EEPROM,
+    writes 0x00 to addresses 0-1 (size field), commits to flash. Triggers system
+    reset via ResetModule() which calls NVIC_SystemReset().
+
+ResetModule()
+    Performs software reset. Disables interrupts via __disable_irq(). Calls
+    NVIC_SystemReset() to restart microcontroller. Does not return.
+
+ReadLocalFlashData()
+    Reads arbitrary flash addresses. Validates nvAddress in range 0x5000-0x3FFFF
+    (application region) or below 0x5000 (bootloader region). Copies numData
+    bytes from flash address to data buffer using memcpy(). Returns 0 on success,
+    2 if address out of range.
+
+EEPROM_erase()
+    Fills entire EEPROM with 0xFF (erased state). Creates buffer of
+    EEPROM_ERASE_SIZE bytes filled with 0xFF. Opens EEPROM. Writes erase buffer
+    repeatedly in EEPROM_ERASE_SIZE chunks from 0 to EEPROM_MEMORY_SIZE. Commits
+    changes to flash.
+
+EEPROM_open()
+    Prepares EEPROM for modification. If not already open (memOpen == 0), copies
+    EEPROM_PAGE_COUNT pages (each FLASH_PAGE_SIZE bytes) from flash address
+    EEPROM_START_ADDR into RAM buffer 'page' via memcpy(). Sets memOpen flag to
+    1. Returns 1 on first open, 0 if already open. All subsequent EEPROM_write()
+    calls modify RAM buffer only.
+
+EEPROM_commit()
+    Writes modified RAM buffer back to flash. Returns 0 if EEPROM not open.
+    Disables interrupts. Unlocks flash via HAL_FLASH_Unlock(). Erases
+    EEPROM_PAGE_COUNT pages starting at EEPROM_PAGE_NB in FLASH_BANK_1 via
+    HAL_FLASHEx_Erase(). If erase fails, locks flash, clears buffer, clears
+    memOpen flag, enables interrupts, and returns 0. Writes buffer to flash in
+    16-byte (quad-word) increments via HAL_FLASH_Program() from EEPROM_START_ADDR.
+    Locks flash via HAL_FLASH_Lock(). Enables interrupts. Clears memOpen. Returns
+    1 on success.
+
+EEPROM_discard()
+    Abandons pending EEPROM changes without writing to flash. Returns 0 if not
+    open. Clears memOpen flag. Returns 1. RAM buffer contents lost but flash
+    unchanged.
+
+EEPROM_write()
+    Modifies EEPROM data in RAM buffer. Returns immediately if EEPROM not open.
+    Copies length bytes from data pointer to page buffer at address offset via
+    memcpy(). Changes remain in RAM until EEPROM_commit() called.
+
+EEPROM_read()
+    Reads data directly from flash EEPROM. Copies length bytes from flash address
+    (EEPROM_START_ADDR + address) to data buffer via memcpy(). Bypasses RAM
+    buffer and returns current flash contents regardless of pending modifications.
+
+
+module/sampling.c
+--------------------------------------------------------------------------------
+Multi-channel ADC sampling control with variable channel support. Manages SPI
+DMA transfers for reading Intan amplifier data.
+
+start_spi_transfers()
+    Initiates DMA transfers for ADC data acquisition. Clears miso_a_ready flag.
+    If INTAN_BankBEnabled, clears miso_b_ready, otherwise sets true to skip.
+    On first call (tx_buffer_initialized == false), generates Intan CONVERT
+    commands via generate_intan_commands() for channels starting at
+    START_CHANNEL_A, stores in tx_command_buffer, and sets initialized flag.
+    Increments debug_transfers_started counter. Starts SPI2 receive DMA via
+    HAL_SPI_Receive_DMA() with INTAN_BufferA destination and
+    ACTIVE_CHANNELS_PER_STREAM count. If BankB enabled, starts SPI3 receive DMA
+    with INTAN_BufferB. Both use 16-bit data units. Calls Error_Handler() on
+    failure. Starts SPI1 transmit DMA with tx_command_buffer to send conversion
+    commands. All three DMA operations execute concurrently. SPI1 master
+    clocking drives data reception on SPI2 and SPI3 slave interfaces.
+
+scan_monitor_process()
+    Polls for completed scans and triggers processing. Called from main loop via
+    updateAppTask(). Checks scan_complete flag set by HAL_SPI_RxCpltCallback().
+    If true, clears flag, increments total_scans_completed counter. Every 500
+    scans toggles PC4 LED for visual feedback (toggles twice per 500 creating
+    250 sample LED period). Calls process_scan() with both buffer pointers and
+    channel count to initiate data processing and transmission.
+
+get_sample_rate_hz()
+    Returns current sampling rate from INTAN_SampleRate object dictionary
+    variable. Configured via CANopen or defaults from sampling_config.h.
+
+get_active_channel_count()
+    Returns total active channels from INTAN_ActiveChannels (0x3A00:2) object
+    dictionary variable. Determines buffer sizes and transmission payload.
+
+start_sampling_timer()
+    Enables TIM2 to begin periodic sampling. Calls HAL_TIM_Base_Start_IT() with
+    htim2 handle to start timer in interrupt mode. Calls Error_Handler() on
+    failure. Timer period configured in MX_TIM2_Init() determines sample rate.
+
+pause_sampling_timer()
+    Pauses sampling without resetting state. Calls HAL_TIM_Base_Stop_IT() to
+    halt TIM2 interrupts. Calls Error_Handler() on failure. Can resume via
+    start_sampling_timer() without reconfiguration.
+
+stop_data_acquisition()
+    Completely halts all sampling operations. Stops TIM2 timer via
+    HAL_TIM_Base_Stop_IT(). Aborts any ongoing SPI DMA transfers via
+    HAL_SPI_Abort() on hspi1, hspi2, and hspi3. Clears all ready and complete
+    flags (miso_a_ready, miso_b_ready, scan_complete) to reset state machine.
+
+restart_data_acquisition()
+    Resumes sampling after stop. Clears all flags (miso_a_ready, miso_b_ready,
+    scan_complete) to ensure clean start. Restarts TIM2 via
+    HAL_TIM_Base_Start_IT(). Calls Error_Handler() on failure. Next timer
+    interrupt triggers start_spi_transfers() to resume acquisition.
+
+HAL_SPI_RxCpltCallback()
+    DMA completion callback invoked when SPI receive finishes. Checks hspi->Instance
+    to identify which SPI peripheral completed. If SPI2, increments
+    debug_spi2_callbacks and sets miso_a_ready flag. If SPI3, increments
+    debug_spi3_callbacks and sets miso_b_ready flag. When both miso_a_ready and
+    miso_b_ready true, clears both flags and sets scan_complete flag to signal
+    scan_monitor_process() that data is ready for processing. Critical section
+    for synchronization between two DMA streams.
+
+update_sampling_parameters()
+    Object dictionary callback registered for index 0x3A00. Called when sampling
+    configuration modified via CANopen. For subindex 1 (INTAN_SampleRate),
+    validates range 1-50000 Hz, writes to TIM2->ARR register as (1000000 /
+    sample_rate) to set timer period in microseconds. Invalid rates reset to
+    1000 Hz default. For subindex 2 (INTAN_ActiveChannels), clears
+    tx_buffer_initialized flag to force regeneration of command buffer on next
+    transfer with new channel count. Returns 0 on success.
+
+MX_TIM2_Init()
+    Configures TIM2 for precise sample rate generation. Enables TIM2 clock.
+    Sets prescaler to TIMER_PRESCALER (160) for 1 MHz timer frequency (160 MHz
+    APB1 / 160). Sets period to TIMER_PERIOD from sampling_config.h or dynamically
+    calculated from INTAN_SampleRate as (1000000 / sample_rate) giving period in
+    microseconds. Configures counter mode up, clock division 1, auto-reload
+    preload enabled. Sets clock source to internal. Disables slave mode. Disables
+    master output triggers. Sets NVIC priority 0,0 for TIM2_IRQn and enables
+    interrupt. Does not start timer (must call start_sampling_timer()).
+
+get_spi_debug_info()
+    Debug function for inspecting SPI and DMA states. Copies debug counters to
+    volatile local variables (debug_transfers_started, debug_spi2_callbacks,
+    debug_spi3_callbacks). Reads SPI states from hspi1.State, hspi2.State,
+    hspi3.State (should be HAL_SPI_STATE_READY 0x01 when idle or
+    HAL_SPI_STATE_BUSY_RX/TX during transfer). Reads error codes from
+    hspi1.ErrorCode, hspi2.ErrorCode, hspi3.ErrorCode (should be
+    HAL_SPI_ERROR_NONE 0x00). Casts to void to prevent unused variable warnings.
+    Set breakpoint in this function to examine all variables during debugging.
+
+generate_intan_commands()
+    Generates Intan CONVERT command sequence. Iterates from start_channel to
+    start_channel + count. For each channel, constructs 16-bit command with
+    format 00 CCCCCC 00000000 where bits [15:14] are 00 (CONVERT opcode), bits
+    [13:8] contain channel number (0-31), and bits [7:0] are 0x00. Formula
+    (channel << 8) shifts channel number into correct bit positions. Stores
+    commands sequentially in cmd_buffer array. Each CONVERT command triggers ADC
+    conversion for specified channel with result appearing on MISO lines 1 data
+    cycle later (pipeline delay).
+
+
+module/scan_data_process.c
+--------------------------------------------------------------------------------
+Processes raw ADC samples from Intan amplifiers. Implements averaging and
+transmission with flow control.
+
+process_scan()
+    Main data processing entry point called from scan_monitor_process(). Increments
+    SamplesProcessedCount statistic. Checks uart_tx_busy flag. If UART busy with
+    previous transmission, increments SamplesDroppedCount and returns immediately
+    to avoid blocking or overwriting buffers. If OversampleRatio equals 1 (no
+    averaging), sets uart_tx_busy flag and directly transmits data. For dual-stream
+    mode (INTAN_BankBEnabled), calls transmit_samples_two() with both buffer_a
+    and buffer_b pointers. For single-stream, calls transmit_samples() with only
+    buffer_a. Increments SamplesTransmittedCount. If OversampleRatio greater than
+    1 (averaging enabled), enters accumulation path. On first sample of averaging
+    window (current_avg_count == 0), zeros channel_sums array via memset().
+    Accumulates samples from buffer_a into channel_sums for indices 0 to
+    n_channels-1. If BankB enabled, accumulates buffer_b into channel_sums for
+    indices n_channels to 2*n_channels-1. Increments current_avg_count. When
+    current_avg_count reaches OversampleRatio, calculates averages for all
+    INTAN_ActiveChannels. For power-of-2 ratios, uses fast bit shift right by
+    __builtin_ctz(OversampleRatio) to divide. Otherwise uses standard division.
+    Stores results in channel_averages array. Resets current_avg_count to 0. Sets
+    uart_tx_busy and transmits via transmit_samples() with channel_averages.
+    Increments SamplesTransmittedCount.
+
+reset_scan_statistics()
+    Clears performance counters. Sets SamplesProcessedCount, SamplesTransmittedCount,
+    and SamplesDroppedCount to 0. Called during initialization or when resetting
+    statistics via CANopen command.
+
+
+module/serial_interface.c
+--------------------------------------------------------------------------------
+UART transmission and command reception interface. Provides binary and ASCII
+output modes with DMA flow control.
+
+transmit_samples()
+    Transmits samples from contiguous buffer. Checks TransmitASCII flag from
+    object dictionary. In ASCII mode, allocates 700-byte buffer, formats data as
+    "$sample0 sample1 sample2 ... sampleN;" string using sprintf(). First sample
+    formatted as "$%u", subsequent samples as " %u", terminated with ";". Transmits
+    formatted string via HAL_UART_Transmit_DMA(). In binary mode, transmits raw
+    sample_buffer as 16-bit little endian values via HAL_UART_Transmit_DMA() with
+    byte count (n_channels * 2). On DMA start failure, clears uart_tx_busy flag
+    to allow retry. Does not block.
+
+transmit_samples_two()
+    Transmits from two separate buffers (MISO A and B). In ASCII mode, allocates
+    temporary 64-sample buffer, copies buffer_a then buffer_b using memcpy() to
+    create contiguous array, calls transmit_samples(). In binary mode, allocates
+    static 64-sample tx_frame, copies both buffers sequentially, transmits via
+    HAL_UART_Transmit_DMA() with total byte count (2 * n_channels_each * 2).
+    Clears uart_tx_busy on failure.
+
+is_uart_busy()
+    Returns current uart_tx_busy flag state. Allows external code to check UART
+    availability before queuing data.
+
+start_command_listener()
+    Begins listening for USART control commands. Calls HAL_UART_Receive_IT() with
+    cmd_rx_buffer (4 bytes) to enable interrupt-driven reception. Callback
+    HAL_UART_RxCpltCallback() processes received commands.
+
+check_command_status()
+    Returns transmission_enabled flag indicating whether START or STOP command
+    most recently received. Used by main loop to conditionally enable sampling.
+
+HAL_UART_RxCpltCallback()
+    UART receive complete callback. Validates huart->Instance is USART1. Compares
+    cmd_rx_buffer against CMD_START ("STRT" bytes). If match, sets
+    transmission_enabled true and command_received true. Compares against CMD_STOP
+    ("STOP" bytes). If match, sets transmission_enabled false and command_received
+    true. Restarts reception via HAL_UART_Receive_IT() to continuously listen for
+    next command. Allows external control of data streaming via simple 4-byte
+    commands.
+
+HAL_UART_TxCpltCallback()
+    UART transmit complete callback. Critical for DMA flow control. Validates
+    huart->Instance is USART1. Clears uart_tx_busy flag to signal UART ready for
+    next transmission. Without this callback, uart_tx_busy would never clear
+    causing all subsequent transmissions to fail. Called automatically by DMA
+    interrupt when transmission finishes.
+
+MX_USART1_UART_Init()
+    Configures USART1 for high-speed data transmission. Sets baud rate to
+    UART_BAUDRATE (12 Mbaud from header), 8 data bits, 1 stop bit, no parity,
+    TX and RX mode enabled, no hardware flow control, 16x oversampling, 1-bit
+    sampling disabled, prescaler 1, no advanced features. Calls HAL_UART_Init().
+    Enables FIFO mode via HAL_UARTEx_EnableFifoMode() for better DMA performance
+    at high baud rates. Sets TX FIFO threshold to half-full
+    (UART_TXFIFO_THRESHOLD_1_2) and RX FIFO threshold to half-full
+    (UART_RXFIFO_THRESHOLD_1_2) for optimal latency/throughput tradeoff. Calls
+    Error_Handler() on any configuration failure.
+
+HAL_UART_MspInit()
+    Low-level UART hardware initialization called by HAL_UART_Init(). Configures
+    peripheral clock to system clock (160 MHz). Enables USART1 clock and GPIOA
+    clock. Configures PA9 (TX) and PA10 (RX) as alternate function 7 with no
+    pull resistors and low speed. Initializes GPDMA1_Channel8 for UART TX DMA
+    with peripheral-to-memory direction (note direction appears reversed but
+    correct for UART TX), byte width, single burst, normal mode, low priority,
+    block transfer complete event mode. Links DMA handle to huart TX. Sets
+    non-privileged channel attributes. Configures USART1 interrupt priority 0,0
+    and enables in NVIC.
+
+
+ObjDict.c
+--------------------------------------------------------------------------------
+CANopen object dictionary definition generated from configuration tool. Contains
+all CANopen communication parameters and application-specific variables.
+
+Contains definitions for mandatory objects 0x1000 (Device Type), 0x1001 (Error
+Register), 0x1003 (Pre-defined Error Field), 0x1005 (SYNC COB-ID), 0x1006
+(Communication Cycle Period), 0x1017 (Producer Heartbeat Time), 0x1018 (Identity
+Object with vendor ID, product code, revision, serial number), 0x1200 (Server
+SDO parameters), 0x1400-0x1403 (Receive PDO Communication Parameters),
+0x1600-0x1603 (Receive PDO Mapping Parameters), 0x1800-0x1803 (Transmit PDO
+Communication Parameters), 0x1A00-0x1A03 (Transmit PDO Mapping Parameters).
+
+Includes application-specific objects at 0x3A00 for sampling configuration with
+subindex 1 (INTAN_SampleRate, default 1000 Hz), subindex 2 (INTAN_ActiveChannels,
+default 32), subindex 3 (OversampleRatio, default 1), subindex 4 (TransmitASCII
+flag, default 0 for binary), subindex 5 (INTAN_BankBEnabled flag, default 1 for
+dual stream).
+
+Defines INTAN_BufferA and INTAN_BufferB arrays (each 32 uint16_t elements) for
+storing received ADC samples. Defines CAN error counters (CAN_BitErrors,
+CAN_StuffErrors, etc) for diagnostics. Defines sample processing statistics
+(SamplesProcessedCount, SamplesTransmittedCount, SamplesDroppedCount).
+
+Provides RegisterSetODentryCallBack() function to register callbacks triggered
+when specific object dictionary entries modified via SDO or PDO. Used to
+synchronize configuration changes with hardware (e.g., updating timer period when
+sample rate changes).
+
+Exports ObjDict_Data structure containing pointers to all object arrays, callback
+tables, index ranges, node ID, and state machine variables. This structure passed
+to all CANopen functions as 'd' parameter providing access to complete node
+configuration and state.

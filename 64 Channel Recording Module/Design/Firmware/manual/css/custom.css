@@ -1,0 +1,23 @@
+html {
+    /* override light-mode variables here */
+    --primary-color: #0C6F6E;
+    --primary-dark-color: #205d3b;
+    --primary-light-color: #33925d;
+
+    --searchbar-background: var(--page-background-color);
+    --searchbar-foreground: var(--page-foreground-color);
+
+    --link-color: #0C6F6E;
+}
+
+html.dark-mode {
+    /* define dark-mode variable overrides here if you DO use doxygen-awesome-darkmode-toggle.js */
+    --primary-color: #0C6F6E;
+    --primary-dark-color: #1a8870;
+    --primary-light-color: #29d5b0;
+
+    --side-nav-background: #002c2a;
+    --header-background: #002c2a;
+
+    --link-color: #0C6F6E;
+}

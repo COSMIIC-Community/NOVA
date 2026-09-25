@@ -1,0 +1,4 @@
+{
+    "stm32-for-vscode.openOCDPath": "/usr/local/bin/openocd",
+    "stm32-for-vscode.armToolchainPath": "/Applications/ArmGNUToolchain/14.2.rel1/arm-none-eabi/bin"
+}

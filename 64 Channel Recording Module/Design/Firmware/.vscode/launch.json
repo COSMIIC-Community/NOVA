@@ -1,0 +1,48 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug (ST-Link GDB server)",
+            "type": "cortex-debug",
+            "request": "launch",
+            "servertype": "stlink",
+            "cwd": "${workspaceFolder}",
+            "executable": "${workspaceFolder}/build/Debug/Implantables_Nova_App_main.elf",
+            "device": "STM32U5A5QJIxQ",
+            "interface": "swd",
+            "overrideLaunchCommands": [
+                "monitor reset",
+                "load"
+            ],
+            "runToEntryPoint": "main",
+            "preLaunchTask": "CMake Build (Debug)",
+            "serverpath": "/opt/ST/STM32CubeCLT_1.22.0/STLink-gdb-server/bin/ST-LINK_gdbserver",
+            "stm32cubeprogrammer": "/opt/ST/STM32CubeCLT_1.22.0/STM32CubeProgrammer/bin",
+            "gdbPath": "/opt/ST/STM32CubeCLT_1.22.0/GNU-tools-for-STM32/bin/arm-none-eabi-gdb",
+            "svdFile": "/opt/ST/STM32CubeCLT_1.22.0/STMicroelectronics_CMSIS_SVD/STM32U5A5.svd"
+        },
+        {
+            "name": "Debug (OpenOCD)",
+            "type": "cortex-debug",
+            "request": "launch",
+            "servertype": "openocd",
+            "cwd": "${workspaceFolder}",
+            "executable": "${workspaceFolder}/build/Debug/Implantables_Nova_App_main.elf",
+            "device": "STM32U5A5QJIxQ",
+            "interface": "swd",
+            "overrideLaunchCommands": [
+                "monitor reset halt",
+                "load"
+            ],
+            "runToEntryPoint": "main",
+            "preLaunchTask": "CMake Build (Debug)",
+            "serverpath": "/usr/local/bin/openocd",
+            "configFiles": [
+                "interface/stlink.cfg",
+                "target/stm32u5x.cfg"
+            ],
+            "gdbPath": "/opt/ST/STM32CubeCLT_1.22.0/GNU-tools-for-STM32/bin/arm-none-eabi-gdb",
+            "svdFile": "/opt/ST/STM32CubeCLT_1.22.0/STMicroelectronics_CMSIS_SVD/STM32U5A5.svd"
+        }
+    ]
+}

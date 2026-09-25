@@ -1,0 +1,7 @@
+{
+    "recommendations": [
+        "marus25.cortex-debug",
+        "bmd.stm32-for-vscode",
+        "ms-vscode.cpptools"
+    ]
+}
