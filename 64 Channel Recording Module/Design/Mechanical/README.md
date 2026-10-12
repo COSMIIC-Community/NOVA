@@ -2,9 +2,9 @@
 
 ## DESCRIPTION
 Contains mechanical design files for the 64 channel implantable enclosure. Assembly shown below.
-![alt text](HIVEassembly.PNG?)
+![alt text](NOVAassembly.PNG?)
 
-Each bal seal connector in the implant header is a power/communication port to the COSMIIC system via network cable (4). Sensing leads exit the can via commercial 8 pin feedthroughs (covered by (2)) are grouped into two sets of 32 channels. Sensing leads can exit the HIVE module in either direction. The following parts are shared with the COSMIIC system or commercial parts:
+Each bal seal connector in the implant header is a power/communication port to the COSMIIC system via network cable (4). Sensing leads exit the can via commercial 8 pin feedthroughs (covered by (2)) are grouped into two sets of 32 channels. Sensing leads can exit the  module in either direction. The following parts are shared with the COSMIIC system or commercial parts:
 | Part | Quantity | Source  |
 | ------------- | -------------: | ----- |
 | 8 pin sensing feedthrough | 8 | Morgan Advanced Materials Part No. 270913 |
