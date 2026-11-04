@@ -8,7 +8,7 @@ NOVA or "Neural Open-source Versatile Array" is a sub-project of the Cleveland O
 Electronics design: Cynthia Chestek, Alex Vaskov, Dylan Wallace, Olivia Lee  
 Mechanical design: Doug Shire, Janet Gbur, Sonny Behan  
 Regulatory Sponsorship: Paul Cederna  
-COSMIIC Integration: Kevin Kilgore, Brian Smith, Joris Lambrecht  
+COSMIIC Integration: Kevin Kilgore, Brian Smith, Joris Lambrecht, Jeremiah Ukwela  
 
 ## LICENSING
 All of our design files are open-source! You are free to reference, share, and adapt this material according to Creative Commons License Attribution 4.0 ([CC-By-4.0](https://creativecommons.org/licenses/by/4.0/)).
